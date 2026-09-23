@@ -30,3 +30,24 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# ── cub2tif ──
+# build output
+/dist/
+/cub2tif.exe
+/cub2tif
+*.partial
+
+# local data: sample cubes, converted output, reference checkouts
+/cubs/
+/tifs/
+/ISIS3-dev/
+*.cub
+*.tif
+*.lbl
+
+# editors / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
