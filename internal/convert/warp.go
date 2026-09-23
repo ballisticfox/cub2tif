@@ -19,18 +19,58 @@ const (
 )
 
 // CubeSource copies pixels straight from the cube, without reprojection.
+// Each worker reads a whole window as stored, then decodes it tile by tile.
 type CubeSource struct {
 	cube  *isis.Cube
 	bands []int
 	raw   bool
 }
 
+// cubeWindow is one worker's copy of the stored bytes under a window.
+type cubeWindow struct {
+	x0, y0, w int
+	raw       [][]byte // per band, packed rows of w samples
+}
+
 func (s *CubeSource) Bands() int    { return len(s.bands) }
-func (s *CubeSource) NewState() any { return nil }
-func (s *CubeSource) Fill(_ any, x0, y0, w, h int, dst [][]float64, stride int) error {
+func (s *CubeSource) NewState() any { return &cubeWindow{raw: make([][]byte, len(s.bands))} }
+
+// Window asks for reads of at least 16 KB per row, up to 8 tiles and 8 MB
+// per worker.
+func (s *CubeSource) Window(tile int) int {
+	bps := s.cube.Type.Size()
+	k := 1
+	for k < 8 && k*tile*bps < 16<<10 {
+		k *= 2
+	}
+	for k > 1 && k*tile*tile*bps*len(s.bands) > 8<<20 {
+		k /= 2
+	}
+	return k
+}
+
+func (s *CubeSource) Load(state any, x0, y0, w, h int) error {
+	st := state.(*cubeWindow)
+	st.x0, st.y0, st.w = x0, y0, w
+	n := w * h * s.cube.Type.Size()
 	for i, b := range s.bands {
-		if err := s.cube.ReadRegion(b, x0, y0, w, h, dst[i], stride, s.raw); err != nil {
+		if cap(st.raw[i]) < n {
+			st.raw[i] = make([]byte, n)
+		}
+		if err := s.cube.ReadRaw(b, x0, y0, w, h, st.raw[i][:n]); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+func (s *CubeSource) Fill(state any, x0, y0, w, h int, dst [][]float64, stride int) error {
+	st := state.(*cubeWindow)
+	bps := s.cube.Type.Size()
+	for i := range s.bands {
+		for r := 0; r < h; r++ {
+			o := ((y0-st.y0+r)*st.w + x0 - st.x0) * bps
+			s.cube.Decode(st.raw[i][o:o+w*bps], dst[i][r*stride:r*stride+w], s.raw)
 		}
 	}
 	return nil
@@ -138,7 +178,7 @@ type l1Entry struct {
 type warpState struct {
 	u, v   []float64
 	ok     []bool
-	l1     [128]l1Entry
+	l1     [16]l1Entry // recent blocks, looked up without the cache lock; kept small, as it holds blocks the cache may have dropped
 	lastID int
 	last   *block
 	err    error
@@ -155,6 +195,11 @@ func newWarpSource(c *isis.Cube, bands []int, raw bool, dp *proj.Projection, dg 
 }
 
 func (s *WarpSource) Bands() int { return len(s.bands) }
+
+// Window is a single tile: the block cache already turns scattered source
+// access into block-sized reads.
+func (s *WarpSource) Window(int) int                     { return 1 }
+func (s *WarpSource) Load(any, int, int, int, int) error { return nil }
 
 func (s *WarpSource) NewState() any {
 	st := &warpState{lastID: -1}

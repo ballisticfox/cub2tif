@@ -28,7 +28,7 @@ func computeStretch(c *isis.Cube, bands []int, raw bool, mode string) ([]geotiff
 		}
 		return out, nil
 	}
-	nrows := min(c.H, 1024)
+	nrows := sampleRows(c, 1024, 32<<20)
 	step := max(1, c.W*nrows/2_000_000)
 	row := make([]float64, c.W)
 	for i, b := range bands {

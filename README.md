@@ -127,6 +127,28 @@ The range always covers the whole source cube. A cropped or reprojected output c
 - **Unprojected cubes:** level-1 cubes with no Mapping group are converted without georeferencing.
 - **Global maps:** these wrap across the antimeridian when warping, so there's no seam.
 
+## Large cubes
+
+Cubes of any size convert in a few hundred MB of memory. Memory depends on the thread count and tile size, never on the image's width, height or band count. That holds for plain conversion, overviews, `--normalize`, `--stretch` and reprojection alike:
+
+- **Windows.** Each thread takes a run of up to 8 tiles in one row (a *window*), reads it from the cube in a single pass, and encodes it tile by tile. Band-sequential cubes are read in long runs rather than one tile row at a time, and every thread reads through its own file handle, because Windows makes reads that share a handle wait for each other.
+- **Overviews** are built as a quadtree. Each finished tile is shrunk into its quarter of the tile one level up, and that tile is written as soon as its last quarter arrives. Windows are visited in square blocks in Z order, so only a handful of partly built overview tiles exist at any time.
+- **Bands** are written in passes: one band at a time for a plain conversion, up to 16 at a time when reprojecting. A 400-band cube never holds 400 bands in memory.
+- **Scans** for `--normalize` (exact min/max) and `--stretch` (sampled percentiles) read in bounded chunks.
+
+`--threads` lowers memory further if needed. Reprojection also uses the source block cache (`--cache`, 1024 MB by default).
+
+Measured on the same machine as below, v1.2 → v1.3, output pixel-identical:
+
+| Cube | Job | Time | Peak memory |
+|---|---|---|---|
+| 400,000 × 16,384 float32, band-sequential (26 GB) | plain | 225 s → 29 s | 110 → 241 MB |
+| | `--overviews` | 237 s → 40 s | 4.9 GB → 267 MB |
+| | `--normalize` | 259 s → 59 s | 3.2 GB → 287 MB |
+| | `-p ps:north --overviews` | 173 s → 51 s | 6.0 GB → 1.75 GB |
+| 120,000 × 60,000 float32, tiled (29 GB, read from disk) | `--overviews` | 213 s → 61 s | 1.6 GB → 260 MB |
+| 16,384² × 20 bands int16, band-sequential (11 GB) | `--overviews` | 148 s → 27 s | 5.1 GB → 350 MB |
+
 ## Validation (against GDAL 3.12 / PROJ)
 
 - **Straight conversion:** tested on all five sample Titan cubes. Pixels, nodata masks, geotransforms and CRS are bit-identical to GDAL's ISIS3 driver.
@@ -171,6 +193,7 @@ The unit tests cover:
 - label parsing
 - reading every cube layout and special-pixel value
 - round trips through the TIFF writer, checked with a minimal TIFF reader
+- every tile of every overview level from the pipeline (windows, band passes, thread counts) against a whole-image reference
 - forward/inverse round trips for every projection on a sphere and an ellipsoid
 - projection-spec parsing, output naming and input expansion
 

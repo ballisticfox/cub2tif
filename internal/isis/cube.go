@@ -53,8 +53,12 @@ type Cube struct {
 	BandInfo []string         // per-band names from the BandBin group, if any
 
 	tilesX, tilesY int
+	files          chan *os.File // idle read handles; see readAt
 	bufPool        sync.Pool
 }
+
+// maxIdleHandles bounds how many read handles a cube keeps open.
+const maxIdleHandles = 64
 
 // Open reads a cube's label and prepares it for reading.
 func Open(path string) (*Cube, error) {
@@ -90,7 +94,7 @@ func Open(path string) (*Cube, error) {
 		}
 		n *= 4
 	}
-	c := &Cube{Path: path, DataPath: path, f: f, Label: root}
+	c := &Cube{Path: path, DataPath: path, f: f, Label: root, files: make(chan *os.File, maxIdleHandles)}
 	if err := c.parse(); err != nil {
 		c.f.Close()
 		return nil, err
@@ -98,7 +102,38 @@ func Open(path string) (*Cube, error) {
 	return c, nil
 }
 
-func (c *Cube) Close() error { return c.f.Close() }
+func (c *Cube) Close() error {
+	for {
+		select {
+		case f := <-c.files:
+			f.Close()
+		default:
+			return c.f.Close()
+		}
+	}
+}
+
+// readAt fills p from offset off of the pixel file, through a handle no other
+// goroutine is using: Windows serializes the reads on any one handle, which
+// would leave all but one worker waiting.
+func (c *Cube) readAt(p []byte, off int64) error {
+	var f *os.File
+	select {
+	case f = <-c.files:
+	default:
+		var err error
+		if f, err = os.Open(c.DataPath); err != nil {
+			return err
+		}
+	}
+	_, err := f.ReadAt(p, off)
+	select {
+	case c.files <- f:
+	default:
+		f.Close()
+	}
+	return err
+}
 
 func (c *Cube) parse() error {
 	isis := c.Label.Child("IsisCube")
@@ -223,54 +258,83 @@ func (c *Cube) putBuf(b []byte) { c.bufPool.Put(&b) }
 // the given row stride. Special pixels become NaN. If raw is false the ISIS
 // Base/Multiplier are applied.
 func (c *Cube) ReadRegion(band, x0, y0, w, h int, dst []float64, stride int, raw bool) error {
-	if x0 < 0 || y0 < 0 || x0+w > c.W || y0+h > c.H || band < 0 || band >= c.B {
+	if err := c.checkRegion(band, x0, y0, w, h); err != nil {
+		return err
+	}
+	// read in pieces of about 1 MB, whole rows at a time
+	rowBytes := w * c.Type.Size()
+	rows := min(h, max(1, (1<<20)/rowBytes))
+	buf := c.getBuf(rows * rowBytes)
+	defer c.putBuf(buf)
+	for r := 0; r < h; r += rows {
+		n := min(rows, h-r)
+		if err := c.ReadRaw(band, x0, y0+r, w, n, buf); err != nil {
+			return err
+		}
+		for i := 0; i < n; i++ {
+			o := (r + i) * stride
+			c.Decode(buf[i*rowBytes:(i+1)*rowBytes], dst[o:o+w], raw)
+		}
+	}
+	return nil
+}
+
+func (c *Cube) checkRegion(band, x0, y0, w, h int) error {
+	if x0 < 0 || y0 < 0 || w <= 0 || h <= 0 || x0+w > c.W || y0+h > c.H || band < 0 || band >= c.B {
 		return fmt.Errorf("region out of bounds")
 	}
+	return nil
+}
+
+// ReadRaw reads band (0-based) pixels [x0,x0+w) x [y0,y0+h) as stored, into
+// dst as packed rows of w samples; Decode turns them into values. Wide
+// regions make for few, large reads: whole rows of a band-sequential cube
+// are a single read.
+func (c *Cube) ReadRaw(band, x0, y0, w, h int, dst []byte) error {
+	if err := c.checkRegion(band, x0, y0, w, h); err != nil {
+		return err
+	}
 	bps := c.Type.Size()
+	rowBytes := w * bps
+	dst = dst[:h*rowBytes]
 	if !c.Tiled {
-		rowBytes := w * bps
-		buf := c.getBuf(rowBytes)
-		defer c.putBuf(buf)
+		off := c.Start + ((int64(band)*int64(c.H)+int64(y0))*int64(c.W)+int64(x0))*int64(bps)
+		if w == c.W {
+			return c.readAt(dst, off)
+		}
 		for r := 0; r < h; r++ {
-			off := c.Start + ((int64(band)*int64(c.H)+int64(y0+r))*int64(c.W)+int64(x0))*int64(bps)
-			if _, err := c.f.ReadAt(buf, off); err != nil {
+			if err := c.readAt(dst[r*rowBytes:(r+1)*rowBytes], off+int64(r)*int64(c.W)*int64(bps)); err != nil {
 				return err
 			}
-			c.decode(buf, dst[r*stride:r*stride+w], raw)
 		}
 		return nil
 	}
 	tileBytes := int64(c.TS*c.TL) * int64(bps)
-	ty0, ty1 := y0/c.TL, (y0+h-1)/c.TL
-	tx0, tx1 := x0/c.TS, (x0+w-1)/c.TS
 	buf := c.getBuf(c.TS * c.TL * bps)
 	defer c.putBuf(buf)
-	for ty := ty0; ty <= ty1; ty++ {
-		ra := max(y0, ty*c.TL) - ty*c.TL
+	for ty := y0 / c.TL; ty <= (y0+h-1)/c.TL; ty++ {
+		ra := max(y0, ty*c.TL) - ty*c.TL // rows of this tile inside the region
 		rb := min(y0+h, (ty+1)*c.TL) - ty*c.TL
-		for tx := tx0; tx <= tx1; tx++ {
+		for tx := x0 / c.TS; tx <= (x0+w-1)/c.TS; tx++ {
 			ca := max(x0, tx*c.TS) - tx*c.TS
 			cb := min(x0+w, (tx+1)*c.TS) - tx*c.TS
 			tileIdx := (int64(band)*int64(c.tilesY)+int64(ty))*int64(c.tilesX) + int64(tx)
-			off := c.Start + tileIdx*tileBytes + int64(ra*c.TS*bps)
-			n := (rb - ra) * c.TS * bps
-			b := buf[:n]
-			if _, err := c.f.ReadAt(b, off); err != nil {
+			b := buf[:(rb-ra)*c.TS*bps]
+			if err := c.readAt(b, c.Start+tileIdx*tileBytes+int64(ra*c.TS*bps)); err != nil {
 				return err
 			}
 			for r := ra; r < rb; r++ {
-				src := b[((r-ra)*c.TS+ca)*bps : ((r-ra)*c.TS+cb)*bps]
-				dr := ty*c.TL + r - y0
-				dc := tx*c.TS + ca - x0
-				c.decode(src, dst[dr*stride+dc:dr*stride+dc+(cb-ca)], raw)
+				o := (ty*c.TL+r-y0)*rowBytes + (tx*c.TS+ca-x0)*bps
+				copy(dst[o:], b[((r-ra)*c.TS+ca)*bps:((r-ra)*c.TS+cb)*bps])
 			}
 		}
 	}
 	return nil
 }
 
-// decode converts raw cube bytes to float64, mapping special pixels to NaN.
-func (c *Cube) decode(src []byte, dst []float64, raw bool) {
+// Decode converts stored samples to float64, mapping special pixels to NaN
+// and, unless raw, applying Base/Multiplier.
+func (c *Cube) Decode(src []byte, dst []float64, raw bool) {
 	var bo binary.ByteOrder = binary.LittleEndian
 	if c.BigEnd {
 		bo = binary.BigEndian

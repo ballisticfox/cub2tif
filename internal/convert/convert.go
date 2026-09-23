@@ -5,6 +5,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -50,8 +51,8 @@ type job struct {
 	level     int
 	pred      int
 	warp      bool
-	src       TileSource
-	proj      *proj.Projection // nil: not georeferenced
+	source    func(bands []int) TileSource // pixels for a subset of the bands
+	proj      *proj.Projection             // nil: not georeferenced
 	grid      raster.Grid
 }
 
@@ -224,7 +225,7 @@ func (j *job) chooseCompression() error {
 func (j *job) chooseGrid() error {
 	c, o := j.c, j.o
 	if !j.warp {
-		j.src = &CubeSource{cube: c, bands: j.bands, raw: o.Raw}
+		j.source = func(bands []int) TileSource { return &CubeSource{cube: c, bands: bands, raw: o.Raw} }
 		j.grid = raster.Grid{W: c.W, H: c.H}
 		if c.Proj == nil {
 			reason := "no Mapping group"
@@ -266,7 +267,9 @@ func (j *job) chooseGrid() error {
 	if o.Exact {
 		approx = 0
 	}
-	j.src = newWarpSource(c, j.bands, o.Raw, j.proj, j.grid, rs, approx, int64(o.CacheMB)<<20, o.Threads)
+	j.source = func(bands []int) TileSource {
+		return newWarpSource(c, bands, o.Raw, j.proj, j.grid, rs, approx, int64(o.CacheMB)<<20, o.Threads)
+	}
 	return nil
 }
 
@@ -351,7 +354,8 @@ func (j *job) write() error {
 	if err != nil {
 		return err
 	}
-	p := &Pipeline{src: j.src, w: w, enc: enc, threads: max(o.Threads, 1), ovAverage: ovAverage}
+	p := &Pipeline{out: w, levels: w.Levels, tile: w.Tile, enc: enc, threads: max(o.Threads, 1), ovAverage: ovAverage}
+	j.limitMemory(p.threads)
 	if !o.Quiet {
 		fmt.Fprintf(os.Stderr, "  %s -> %s\n", filepath.Base(j.in), j.out)
 		if j.warp {
@@ -359,7 +363,7 @@ func (j *job) write() error {
 		}
 		p.progress = progressBar()
 	}
-	if err := p.Run(); err != nil {
+	if err := p.Run(j.bandGroups(lay.Interleaved), j.source); err != nil {
 		w.Abort()
 		return err
 	}
@@ -378,6 +382,43 @@ func (j *job) write() error {
 		}
 	}
 	return nil
+}
+
+// limitMemory sets a soft memory limit a little above what the job needs.
+// Source blocks churn through the warp cache, and without a limit the heap
+// grows to twice what is live before the garbage collector runs. A
+// GOMEMLIMIT set by the user wins.
+func (j *job) limitMemory(threads int) {
+	if os.Getenv("GOMEMLIMIT") != "" {
+		return
+	}
+	limit := int64(256+32*threads) << 20
+	if j.warp {
+		limit += int64(j.o.CacheMB) << 20
+	}
+	debug.SetMemoryLimit(limit)
+}
+
+// bandGroups splits the bands into passes over the image, so that memory
+// does not grow with the band count. A straight copy takes one band per pass
+// (which also reads the cube front to back); reprojection shares each
+// coordinate transform among up to 32 MB of tile buffers per worker (16
+// bands at the default tile size). Interleaved output needs every band in
+// each tile, so it is a single pass.
+func (j *job) bandGroups(interleaved bool) [][]int {
+	per := len(j.bands)
+	switch {
+	case interleaved:
+	case j.warp:
+		per = max(1, (32<<20)/(j.o.Tile*j.o.Tile*8))
+	default:
+		per = 1
+	}
+	var groups [][]int
+	for i := 0; i < len(j.bands); i += per {
+		groups = append(groups, j.bands[i:min(i+per, len(j.bands))])
+	}
+	return groups
 }
 
 func (j *job) report(elapsed time.Duration) {

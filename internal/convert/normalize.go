@@ -82,14 +82,16 @@ func planNormalize(c *isis.Cube, bands []int, o *Options, pt raster.PixType, war
 }
 
 // scanRange reads every selected band once, in parallel, for the exact
-// minimum and maximum of the valid pixels.
+// minimum and maximum of the valid pixels. It works in chunks of about a
+// million pixels: whole rows unless the image is very wide.
 func scanRange(c *isis.Cube, bands []int, raw bool, threads int) (lo, hi float64, invalid int64, err error) {
-	bh := 64
-	if c.Tiled {
-		bh = c.TL
+	cw := min(c.W, 1<<14)
+	if c.Tiled && cw < c.W {
+		cw = max(c.TS, cw/c.TS*c.TS) // don't split the cube's tiles
 	}
-	type job struct{ band, y int }
-	jobs := make(chan job, threads*2)
+	ch := max(1, (1<<20)/cw)
+	type chunk struct{ band, x, y int }
+	jobs := make(chan chunk, threads*2)
 	var mu sync.Mutex
 	lo, hi = math.Inf(1), math.Inf(-1)
 	var wg sync.WaitGroup
@@ -97,18 +99,18 @@ func scanRange(c *isis.Cube, bands []int, raw bool, threads int) (lo, hi float64
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			buf := make([]float64, c.W*bh)
+			buf := make([]float64, cw*ch)
 			l, h, bad := math.Inf(1), math.Inf(-1), int64(0)
 			var e error
 			for j := range jobs {
 				if e != nil {
 					continue
 				}
-				n := min(bh, c.H-j.y)
-				if e = c.ReadRegion(j.band, 0, j.y, c.W, n, buf, c.W, raw); e != nil {
+				w, n := min(cw, c.W-j.x), min(ch, c.H-j.y)
+				if e = c.ReadRegion(j.band, j.x, j.y, w, n, buf, w, raw); e != nil {
 					continue
 				}
-				for _, v := range buf[:c.W*n] {
+				for _, v := range buf[:w*n] {
 					if v != v {
 						bad++
 						continue
@@ -130,8 +132,10 @@ func scanRange(c *isis.Cube, bands []int, raw bool, threads int) (lo, hi float64
 		}()
 	}
 	for _, b := range bands {
-		for y := 0; y < c.H; y += bh {
-			jobs <- job{b, y}
+		for y := 0; y < c.H; y += ch {
+			for x := 0; x < c.W; x += cw {
+				jobs <- chunk{b, x, y}
+			}
 		}
 	}
 	close(jobs)
@@ -143,7 +147,7 @@ func scanRange(c *isis.Cube, bands []int, raw bool, threads int) (lo, hi float64
 // normalizing: a spread of rows, never more than a few million pixels.
 func SampledRange(c *isis.Cube, bands []int, raw bool) (lo, hi float64) {
 	lo, hi = math.Inf(1), math.Inf(-1)
-	nrows := min(c.H, 64)
+	nrows := sampleRows(c, 64, 4<<20)
 	step := max(1, c.W*nrows*len(bands)/2_000_000)
 	row := make([]float64, c.W)
 	for _, b := range bands {
@@ -160,6 +164,13 @@ func SampledRange(c *isis.Cube, bands []int, raw bool) (lo, hi float64) {
 		}
 	}
 	return
+}
+
+// sampleRows is how many evenly spread rows to sample: up to maxRows, fewer
+// on a wide image so that no more than about maxPixels are read (but at
+// least 8).
+func sampleRows(c *isis.Cube, maxRows, maxPixels int) int {
+	return min(c.H, maxRows, max(8, maxPixels/c.W))
 }
 
 // labelPath is where the .lbl for an output goes: beside it, same name. It

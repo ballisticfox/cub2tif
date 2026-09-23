@@ -7,7 +7,7 @@ import (
 )
 
 // Version is written into the labels this package produces.
-const Version = "1.2.0"
+const Version = "1.3.0"
 
 // progressBar draws a one-line bar on stderr when it is a terminal.
 func progressBar() func(done, total int64) {
